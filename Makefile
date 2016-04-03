@@ -10,7 +10,12 @@ check: default
 
 ifneq ($(GOPATH),)
 build: default
-	go get golang.org/x/crypto/ssh/terminal
+	go get github.com/BurntSushi/freetype-go/freetype/truetype
+	go get github.com/BurntSushi/xgb/xproto
+	go get github.com/BurntSushi/xgbutil
+	go get github.com/BurntSushi/xgbutil/keybind
+	go get github.com/BurntSushi/xgbutil/xevent
+	go get github.com/BurntSushi/xgbutil/xgraphics
 	go build $(NAME)
 endif
 

@@ -3,21 +3,20 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/signal"
+	"runtime/pprof"
 	"sync"
 	"syscall"
 
-	"golang.org/x/crypto/ssh/terminal"
-
 	"ditor/dup"
 	"ditor/edit"
+	"ditor/ui"
 )
 
 const (
-	appSubDir   = "ditor"
+	appName     = "ditor"
 	userRunDir  = "/run/user"
 	defaultName = "default"
 )
@@ -30,15 +29,35 @@ func main() {
 	os.Exit(mainResult())
 }
 
+func initSignals() (some chan os.Signal) {
+	all := make(chan os.Signal)
+	signal.Notify(all, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGQUIT)
+
+	some = make(chan os.Signal)
+
+	go func() {
+		defer close(some)
+
+		for sig := range all {
+			if sig == syscall.SIGQUIT {
+				pprof.Lookup("goroutine").WriteTo(os.Stderr, 2)
+			} else {
+				some <- sig
+			}
+		}
+	}()
+
+	return
+}
+
 func mainResult() (status int) {
-	signals := make(chan os.Signal)
-	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGQUIT, syscall.SIGWINCH)
+	signals := initSignals()
 
 	editor := new(edit.Editor)
 
 	duper := &dup.Duper{
 		State:   editor,
-		SockDir: fmt.Sprintf("%s/%d/%s", userRunDir, os.Getuid(), appSubDir),
+		SockDir: fmt.Sprintf("%s/%d/%s", userRunDir, os.Getuid(), appName),
 	}
 
 	newState := flag.Bool("new", false, "start with an empty state (requires -n, ignores -s)")
@@ -66,7 +85,6 @@ func mainResult() (status int) {
 	}
 
 	editor.Init()
-	log.Printf("initial: %#v", editor)
 
 	if duper.Name == "" {
 		flag.Usage()
@@ -82,78 +100,47 @@ func mainResult() (status int) {
 	}
 	defer duper.Close()
 
-	if !terminal.IsTerminal(syscall.Stdin) {
-		log.Print("stdin is not a terminal")
-		return 3
-	}
-	origTermState, err := terminal.MakeRaw(syscall.Stdin)
+	x, err := ui.New(appName)
 	if err != nil {
 		log.Print(err)
 		return 3
 	}
-	defer terminal.Restore(syscall.Stdin, origTermState)
-	term := terminal.NewTerminal(os.Stdin, "content: ")
+	defer x.Close()
 
-	errors := make(chan error, 2)
-	defer func() {
-		select {
-		case err := <-errors:
-			log.Print("")
-			log.Print(err)
-			status = 3
-
-		default:
-			log.Print("")
-		}
-	}()
-
-	termInput := make(chan string)
-	go func() {
-		defer close(termInput)
-		for {
-			line, err := term.ReadLine()
-			if err != nil {
-				if err != io.EOF {
-					errors <- err
-				}
-				return
-			}
-			termInput <- line
-		}
-	}()
+	if err := x.Refresh(editor); err != nil {
+		log.Print(err)
+		return 3
+	}
 
 	for {
 		select {
-		case sig := <-signals:
-			switch sig {
-			case syscall.SIGWINCH:
-				width, height, err := terminal.GetSize(syscall.Stdin)
-				if err != nil {
-					errors <- err
-					return
-				}
+		case <-x.BeforeEvent:
+			<-x.AfterEvent
 
-				if err := term.SetSize(width, height); err != nil {
-					errors <- err
-					return
-				}
+		case <-x.Stopped:
+			return
 
-			default:
-				panic(sig)
-			}
-
-		case line, ok := <-termInput:
+		case edit, ok := <-x.Edits:
 			if !ok {
 				return
 			}
-			handleInput(&duper.Mutex, editor, line)
+
+			handle(&duper.Mutex, editor, edit)
+
+			if err := x.Refresh(editor); err != nil {
+				log.Print(err)
+				return 3
+			}
+
+		case sig := <-signals:
+			panic(sig)
 		}
 	}
 }
 
-func handleInput(m *sync.Mutex, e *edit.Editor, s string) {
+func handle(m *sync.Mutex, editor *edit.Editor, edit *edit.Edit) {
 	m.Lock()
 	defer m.Unlock()
 
-	e.Edit(s)
+	editor.Apply(edit)
 }
