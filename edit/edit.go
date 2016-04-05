@@ -118,6 +118,7 @@ func (e *Editor) Init() {
 		e.Indent = defaultIndent
 		e.Name = defaultName
 		e.Filename = ""
+		e.FilePerm = 0
 		e.Dirty = false
 	}
 	e.normalizeCaret()
@@ -226,19 +227,20 @@ func (e *Editor) Apply(edit *Edit) (err error) {
 		if c.Column > 0 {
 			e.Buffer[c.Line] = append(e.Buffer[c.Line][:c.Column-1], e.Buffer[c.Line][c.Column:]...)
 			c.addColumn(-1)
+			e.Dirty = true
 		} else if c.Line > 0 {
 			oldLine := e.Buffer[c.Line]
 			e.Buffer = append(e.Buffer[:c.Line], e.Buffer[c.Line+1:]...)
 			c.Line--
 			c.setColumn(len(e.Buffer[c.Line]))
 			e.Buffer[c.Line] = append(e.Buffer[c.Line], oldLine...)
+			e.Dirty = true
 		}
-		e.Dirty = true
 	} else {
 		switch edit.Char {
 		case '\n':
 			oldLine := e.Buffer[c.Line][:c.Column]
-			newLine := e.Buffer[c.Line][c.Column:]
+			newLine := append([]rune(nil), e.Buffer[c.Line][c.Column:]...)
 			e.Buffer[c.Line] = oldLine
 			c.Line++
 			c.setColumn(0)
