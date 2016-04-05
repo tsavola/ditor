@@ -13,7 +13,7 @@ import (
 	"github.com/BurntSushi/xgbutil/xevent"
 	"github.com/BurntSushi/xgbutil/xgraphics"
 
-	"ditor/edit"
+	"github.com/tsavola/ditor/edit"
 )
 
 const (

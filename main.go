@@ -10,9 +10,9 @@ import (
 	"sync"
 	"syscall"
 
-	"ditor/dup"
-	"ditor/edit"
-	"ditor/ui"
+	"github.com/tsavola/ditor/dup"
+	"github.com/tsavola/ditor/edit"
+	"github.com/tsavola/ditor/ui"
 )
 
 const (
