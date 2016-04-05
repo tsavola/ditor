@@ -1,12 +1,28 @@
 package edit
 
+import (
+	"bufio"
+	"errors"
+	"io"
+	"io/ioutil"
+	"os"
+	"path"
+)
+
+const (
+	TabWidth = 8
+
+	defaultIndent = 4
+	defaultName   = "*scratch*"
+	tempPrefix    = ".ditor"
+)
+
 // Edit
 type Edit struct {
 	Control    bool
 	MoveLine   int
 	MoveColumn int
 	Backspace  bool
-	Return     bool
 	Char       rune
 }
 
@@ -20,6 +36,11 @@ type Pos struct {
 type CaretPos struct {
 	Pos
 	RememberColumn int
+}
+
+func (c *CaretPos) reset() {
+	c.Pos = Pos{}
+	c.forget()
 }
 
 func (c *CaretPos) forget() {
@@ -38,16 +59,131 @@ func (c *CaretPos) addColumn(n int) {
 
 // Editor
 type Editor struct {
-	Buffer [][]rune
-	Caret  CaretPos
+	Buffer   [][]rune
+	Caret    CaretPos
+	Indent   int
+	Name     string
+	Filename string
+	FilePerm os.FileMode
+	Dirty    bool
+}
+
+func (e *Editor) Open(filename string) (err error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return
+	}
+
+	r := bufio.NewReader(f)
+	buf := [][]rune{nil}
+
+	for {
+		ch, _, e := r.ReadRune()
+		if e != nil {
+			if e == io.EOF {
+				break
+			}
+			err = e
+			return
+		}
+
+		if ch == '\n' {
+			buf = append(buf, nil)
+		} else {
+			i := len(buf) - 1
+			buf[i] = append(buf[i], ch)
+		}
+	}
+
+	e.Buffer = buf
+	e.Caret.reset()
+	e.Indent = defaultIndent
+	e.Name = path.Base(filename)
+	e.Filename = filename
+	e.FilePerm = info.Mode() & os.ModePerm
+	e.Dirty = false
+	return
 }
 
 func (e *Editor) Init() {
 	if len(e.Buffer) == 0 {
 		e.Buffer = append(e.Buffer, nil)
 		e.Caret.forget()
+		e.Indent = defaultIndent
+		e.Name = defaultName
+		e.Filename = ""
+		e.Dirty = false
 	}
 	e.normalizeCaret()
+}
+
+func (e *Editor) Save() (err error) {
+	if !e.Dirty {
+		return
+	}
+
+	if e.Filename == "" {
+		err = errors.New("no filename")
+		return
+	}
+
+	dir := path.Dir(e.Filename)
+	if dir == "" {
+		dir = "."
+	}
+
+	f, err := ioutil.TempFile(dir, tempPrefix)
+	if err != nil {
+		return
+	}
+	defer func() {
+		f.Close()
+		if err != nil {
+			os.Remove(f.Name())
+		}
+	}()
+
+	w := bufio.NewWriter(f)
+
+	for i, line := range e.Buffer {
+		for _, ch := range line {
+			_, err = w.WriteRune(ch)
+			if err != nil {
+				return
+			}
+		}
+
+		if i < len(e.Buffer)-1 {
+			_, err = w.WriteRune('\n')
+			if err != nil {
+				return
+			}
+		}
+	}
+
+	err = w.Flush()
+	if err != nil {
+		return
+	}
+
+	err = f.Chmod(e.FilePerm)
+	if err != nil {
+		return
+	}
+
+	err = os.Rename(f.Name(), e.Filename)
+	if err != nil {
+		return
+	}
+
+	e.Dirty = false
+	return
 }
 
 func (e *Editor) Lines() (lines []string) {
@@ -57,7 +193,7 @@ func (e *Editor) Lines() (lines []string) {
 	return
 }
 
-func (e *Editor) Apply(edit *Edit) {
+func (e *Editor) Apply(edit *Edit) (err error) {
 	c := &e.Caret
 
 	if edit.Control {
@@ -67,6 +203,9 @@ func (e *Editor) Apply(edit *Edit) {
 
 		case 'e':
 			c.setColumn(len(e.Buffer[c.Line]))
+
+		case 's':
+			err = e.Save()
 		}
 	} else if edit.MoveLine != 0 {
 		if i := c.Line + edit.MoveLine; i >= 0 && i < len(e.Buffer) {
@@ -94,17 +233,50 @@ func (e *Editor) Apply(edit *Edit) {
 			c.setColumn(len(e.Buffer[c.Line]))
 			e.Buffer[c.Line] = append(e.Buffer[c.Line], oldLine...)
 		}
-	} else if edit.Return {
-		oldLine := e.Buffer[c.Line][:c.Column]
-		newLine := e.Buffer[c.Line][c.Column:]
-		e.Buffer[c.Line] = oldLine
-		c.Line++
-		c.setColumn(0)
-		e.Buffer = append(e.Buffer[:c.Line], append([][]rune{newLine}, e.Buffer[c.Line:]...)...)
+		e.Dirty = true
 	} else {
-		e.Buffer[c.Line] = append(e.Buffer[c.Line][:c.Column], append([]rune{edit.Char}, e.Buffer[c.Line][c.Column:]...)...)
-		c.addColumn(1)
+		switch edit.Char {
+		case '\n':
+			oldLine := e.Buffer[c.Line][:c.Column]
+			newLine := e.Buffer[c.Line][c.Column:]
+			e.Buffer[c.Line] = oldLine
+			c.Line++
+			c.setColumn(0)
+			e.Buffer = append(e.Buffer[:c.Line], append([][]rune{newLine}, e.Buffer[c.Line:]...)...)
+
+		case '\t':
+			column := 0
+			indent := true
+			for n := 0; n < c.Column; n++ {
+				if e.Buffer[c.Line][n] == '\t' {
+					column += TabWidth
+				} else {
+					column++
+					indent = false
+				}
+			}
+			if indent {
+				e.insertChar('\t')
+			} else {
+				for n := 0; n < TabWidth-(column%TabWidth); n++ {
+					e.insertChar(' ')
+				}
+			}
+
+		default:
+			e.insertChar(edit.Char)
+		}
+		e.Dirty = true
 	}
+
+	return
+}
+
+func (e *Editor) insertChar(ch rune) {
+	c := &e.Caret
+
+	e.Buffer[c.Line] = append(e.Buffer[c.Line][:c.Column], append([]rune{ch}, e.Buffer[c.Line][c.Column:]...)...)
+	c.addColumn(1)
 }
 
 func (e *Editor) normalizeCaret() {

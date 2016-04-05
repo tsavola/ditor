@@ -17,12 +17,12 @@ import (
 )
 
 const (
-	defaultWidth  = 640
-	defaultHeight = 480
-	fontFilename  = "/usr/share/fonts/truetype/ubuntu-font-family/UbuntuMono-R.ttf"
-	fontSize      = 20
-	contIndent    = 8
-	editBufSize   = 100 // BUG: full buffer causes deadlock
+	fontFilename   = "/usr/share/fonts/truetype/ubuntu-font-family/UbuntuMono-R.ttf"
+	fontSize       = 20
+	defaultColumns = 80
+	defaultLines   = 30
+	contIndent     = 6
+	editBufSize    = 100 // BUG: full buffer causes deadlock
 )
 
 var (
@@ -38,21 +38,18 @@ type UI struct {
 	Stopped     <-chan struct{}
 	Edits       chan *edit.Edit
 
-	font       *truetype.Font
-	fontWidth  int
-	fontHeight int
-	xutil      *xgbutil.XUtil
-	image      *xgraphics.Image
-	winId      xproto.Window
-	width      int
-	height     int
+	font     *truetype.Font
+	fontSize image.Point
+	winSize  image.Point
+	xutil    *xgbutil.XUtil
+	winImage *xgraphics.Image
+	winId    xproto.Window
+	topLine  int
 }
 
 func New(name string) (ui *UI, err error) {
 	ui = &UI{
-		Edits:  make(chan *edit.Edit, editBufSize),
-		width:  defaultWidth,
-		height: defaultHeight,
+		Edits: make(chan *edit.Edit, editBufSize),
 	}
 
 	fontReader, err := os.Open(fontFilename)
@@ -65,7 +62,8 @@ func New(name string) (ui *UI, err error) {
 		return
 	}
 
-	ui.fontWidth, ui.fontHeight = xgraphics.Extents(ui.font, fontSize, "g")
+	ui.fontSize.X, ui.fontSize.Y = xgraphics.Extents(ui.font, fontSize, "g")
+	ui.winSize = image.Point{ui.fontSize.X*defaultColumns, ui.fontSize.Y*defaultLines}
 
 	ui.xutil, err = xgbutil.NewConn()
 	if err != nil {
@@ -74,16 +72,16 @@ func New(name string) (ui *UI, err error) {
 
 	keybind.Initialize(ui.xutil)
 
-	ui.image = xgraphics.New(ui.xutil, image.Rect(0, 0, ui.width, ui.height))
-	ui.image.For(func(x, y int) xgraphics.BGRA {
+	ui.winImage = xgraphics.New(ui.xutil, image.Rectangle{Max: ui.winSize})
+	ui.winImage.For(func(x, y int) xgraphics.BGRA {
 		return bgColor
 	})
 
-	win := ui.image.XShowExtra(name, true)
+	win := ui.winImage.XShowExtra(name, true)
 	win.Listen(xproto.EventMaskKeyPress)
 	ui.winId = win.Id
 
-	xevent.KeyPressFun(ui.handleKeyPress).Connect(ui.xutil, win.Id)
+	xevent.KeyPressFun(ui.handleKeyPress).Connect(ui.xutil, ui.winId)
 
 	ui.BeforeEvent, ui.AfterEvent, ui.Stopped = xevent.MainPing(ui.xutil)
 	return
@@ -119,7 +117,10 @@ func (ui *UI) handleKeyPress(xutil *xgbutil.XUtil, e xevent.KeyPressEvent) {
 			ui.Edits <- &edit.Edit{Backspace: true}
 
 		case "Return":
-			ui.Edits <- &edit.Edit{Return: true}
+			ui.Edits <- &edit.Edit{Char: '\n'}
+
+		case "Tab":
+			ui.Edits <- &edit.Edit{Char: '\t'}
 
 		default:
 			if len(key) == 1 {
@@ -142,56 +143,115 @@ func (ui *UI) handleKeyPress(xutil *xgbutil.XUtil, e xevent.KeyPressEvent) {
 }
 
 func (ui *UI) Refresh(editor *edit.Editor) (err error) {
-	ui.image.For(func(x, y int) xgraphics.BGRA {
-		return bgColor
-	})
-
-	widthColumns := ui.width / ui.fontWidth
+	widthColumns := ui.winSize.X / ui.fontSize.X
 	contColumns := widthColumns - contIndent
-	c := editor.Caret
-	y := 0
 
-	for i, line := range editor.Lines() {
-		x := 0
-		columns := widthColumns
+	if editor.Caret.Line < ui.topLine {
+		ui.topLine = editor.Caret.Line
+	}
 
-		for {
-			text := line
-			if len(text) > columns {
-				text = line[:columns]
-				line = line[columns:]
-			} else {
-				line = ""
-			}
+	for {
+		restart := false
 
-			if i == c.Line {
-				if c.Column >= 0 && c.Column < columns {
-					r := image.Rectangle{
-						Min: image.Point{x + ui.fontWidth*c.Column, y},
+		ui.winImage.For(func(x, y int) xgraphics.BGRA {
+			return bgColor
+		})
+
+		c := editor.Caret
+		y := 0
+
+		for i, line := range editor.Lines()[ui.topLine:] {
+			i += ui.topLine
+
+			if y >= ui.winSize.Y && c.Line < i {
+				if offset := (y - ui.winSize.Y) / ui.fontSize.Y; offset > 0 {
+					if top := ui.topLine + offset; top < editor.Caret.Line {
+						ui.topLine = top
+						restart = true
 					}
-					r.Max = image.Point{r.Min.X + ui.fontWidth, r.Min.Y + ui.fontHeight}
-					fillRect(ui.image, r, caretColor)
 				}
-				c.Column -= columns
-			}
-
-			_, _, err = ui.image.Text(x, y, textColor, fontSize, ui.font, text)
-			if err != nil {
-				return
-			}
-
-			y += ui.fontHeight
-			x = ui.fontWidth * contIndent
-			columns = contColumns
-
-			if len(line) == 0 {
 				break
 			}
+
+			indenting := true
+
+			for n := 0; n < len(line); {
+				if line[n] == '\t' {
+					var width int
+					if indenting {
+						width = editor.Indent
+					} else {
+						width = edit.TabWidth - (n % edit.TabWidth)
+					}
+
+					prefix := line[:n]
+					suffix := line[n+1:]
+
+					var tab []byte
+					for m := 0; m < width; m++ {
+						tab = append(tab, ' ')
+					}
+
+					line = string(append([]byte(prefix), append(tab, []byte(suffix)...)...))
+
+					if i == c.Line && c.Column > n {
+						c.Column += width - 1
+					}
+
+					n += width
+				} else {
+					indenting = false
+					n++
+				}
+			}
+
+			x := 0
+			columns := widthColumns
+
+			for {
+				text := line
+				if len(text) > columns {
+					text = line[:columns]
+					line = line[columns:]
+				} else {
+					line = ""
+				}
+
+				if i == c.Line {
+					if c.Column >= 0 && c.Column < columns {
+						r := image.Rectangle{
+							Min: image.Point{x + ui.fontSize.X*c.Column, y},
+						}
+						r.Max = image.Point{r.Min.X + ui.fontSize.X, r.Min.Y + ui.fontSize.Y}
+						fillRect(ui.winImage, r, caretColor)
+					}
+					c.Column -= columns
+				}
+
+				_, _, err = ui.winImage.Text(x, y, textColor, fontSize, ui.font, text)
+				if err != nil {
+					return
+				}
+
+				y += ui.fontSize.Y
+				x = ui.fontSize.X * contIndent
+				columns = contColumns
+
+				if len(line) == 0 {
+					break
+				}
+			}
+		}
+
+		if !restart {
+			break
 		}
 	}
 
-	ui.image.XDraw()
-	ui.image.XPaint(ui.winId)
+	log.Printf("caret=%d top=%d", editor.Caret.Line, ui.topLine)
+
+	ui.winImage.XDraw()
+	ui.winImage.XPaint(ui.winId)
 	return
 }
 

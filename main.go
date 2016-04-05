@@ -62,12 +62,20 @@ func mainResult() (status int) {
 
 	newState := flag.Bool("new", false, "start with an empty state (requires -n, ignores -s)")
 	loadName := flag.String("s", defaultName, "load initial state from the named socket")
+	fileName := flag.String("f", "", "open file (requires -new)")
 	flag.StringVar(&duper.Name, "n", duper.Name, "name for the listening socket (defaults -s)")
 	flag.StringVar(&duper.SockDir, "sockdir", duper.SockDir, "default location for sockets")
 
 	flag.Parse()
 
-	if !*newState {
+	if *newState {
+		if *fileName != "" {
+			if err := editor.Open(*fileName); err != nil {
+				log.Print(err)
+				return 3
+			}
+		}
+	} else {
 		if *loadName == "" {
 			flag.Usage()
 			return 2
@@ -100,7 +108,7 @@ func mainResult() (status int) {
 	}
 	defer duper.Close()
 
-	x, err := ui.New(appName)
+	x, err := ui.New(editor.Name)
 	if err != nil {
 		log.Print(err)
 		return 3
@@ -125,7 +133,9 @@ func mainResult() (status int) {
 				return
 			}
 
-			handle(&duper.Mutex, editor, edit)
+			if err := handle(&duper.Mutex, editor, edit); err != nil {
+				log.Print(err)
+			}
 
 			if err := x.Refresh(editor); err != nil {
 				log.Print(err)
@@ -138,9 +148,9 @@ func mainResult() (status int) {
 	}
 }
 
-func handle(m *sync.Mutex, editor *edit.Editor, edit *edit.Edit) {
+func handle(m *sync.Mutex, editor *edit.Editor, edit *edit.Edit) error {
 	m.Lock()
 	defer m.Unlock()
 
-	editor.Apply(edit)
+	return editor.Apply(edit)
 }
